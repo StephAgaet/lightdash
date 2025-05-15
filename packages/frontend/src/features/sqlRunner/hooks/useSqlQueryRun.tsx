@@ -12,7 +12,7 @@ import { lightdashApi } from '../../../api';
 import { getSqlRunnerCompleteJob } from './requestUtils';
 import { useResultsFromStreamWorker } from './useResultsFromStreamWorker';
 
-export const scheduleSqlJob = async ({
+const scheduleSqlJob = async ({
     projectUuid,
     sql,
     limit,
