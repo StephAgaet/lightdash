@@ -59,6 +59,7 @@ import {
     type SpaceShare,
     type SpaceSummary,
     SqlChart,
+    UnexpectedServerError,
     ValuesColumn,
     WarehouseClient,
     type WarehouseExecuteAsyncQuery,
@@ -81,7 +82,6 @@ import {
     MissCacheResult,
     ResultsCacheStatus,
 } from '../CacheService/types';
-import { CsvService } from '../CsvService/CsvService';
 import {
     ProjectService,
     type ProjectServiceArguments,
@@ -92,7 +92,6 @@ import {
 } from '../ProjectService/resultsPagination';
 import { getResultsColumns } from './getResultsColumns';
 import {
-    type DownloadAsyncQueryResultsArgs,
     type ExecuteAsyncDashboardChartQueryArgs,
     type ExecuteAsyncDashboardSqlChartArgs,
     type ExecuteAsyncMetricQueryArgs,
@@ -236,6 +235,7 @@ export class AsyncQueryService extends ProjectService {
             expires_at: newExpiresAt,
             total_row_count: null,
             status: ResultsCacheStatus.PENDING,
+            columns: null,
         });
 
         if (!createdCache) {
@@ -306,6 +306,7 @@ export class AsyncQueryService extends ProjectService {
 
         return {
             rows,
+            columns: cache.columns,
             totalRowCount: cache.total_row_count ?? 0,
             expiresAt: cache.expires_at,
         };
@@ -492,7 +493,12 @@ export class AsyncQueryService extends ProjectService {
             formatRow(row, queryHistory.fields);
 
         const {
-            result: { rows, totalRowCount: cacheTotalRowCount, expiresAt },
+            result: {
+                rows,
+                columns,
+                totalRowCount: cacheTotalRowCount,
+                expiresAt,
+            },
             durationMs,
         } = await measureTime(
             () =>
@@ -568,29 +574,22 @@ export class AsyncQueryService extends ProjectService {
             );
         }
 
-        // Ideally, we should use the warehouse results columns metadata. For now we can rely on the fields.
-        const unpivotedColumns = Object.values(fields).reduce<ResultColumns>(
-            (acc, field) => {
-                const column = {
-                    reference: field.name,
-                    type: convertItemTypeToDimensionType(field),
-                };
-                acc[column.reference] = column;
-                return acc;
-            },
-            {},
-        );
-
         const {
             pivotConfiguration,
             pivotValuesColumns,
             pivotTotalColumnCount,
         } = queryHistory;
 
+        if (!columns) {
+            throw new UnexpectedServerError(
+                `No columns found for query ${queryUuid}`,
+            );
+        }
+
         const returnObject = {
             rows,
             columns: getResultsColumns(
-                unpivotedColumns,
+                columns,
                 pivotConfiguration,
                 pivotValuesColumns,
                 rows,
@@ -620,7 +619,7 @@ export class AsyncQueryService extends ProjectService {
             pivotDetails: {
                 totalColumnCount: pivotTotalColumnCount,
                 valuesColumns: pivotValuesColumns,
-                unpivotedColumns,
+                unpivotedColumns: columns,
             },
         };
     }
@@ -707,6 +706,7 @@ export class AsyncQueryService extends ProjectService {
             sortBy: SortBy | undefined;
         };
     }): Promise<{
+        columns: ResultColumns;
         warehouseResults: WarehouseExecuteAsyncQuery;
         pivotDetails: {
             valuesColumns: Map<string, PivotValuesColumn>;
@@ -721,6 +721,7 @@ export class AsyncQueryService extends ProjectService {
         // Total column count includes the unlimited number of columns that can be pivoted, so we can show a warning in the frontend
         let pivotTotalColumnCount: undefined | number;
         let pivotTotalRows = 0;
+        let columns: ResultColumns = {};
 
         const writeAndTransformRowsIfPivot = pivotConfiguration
             ? (rows: WarehouseResults['rows']) => {
@@ -781,7 +782,25 @@ export class AsyncQueryService extends ProjectService {
                       });
                   });
               }
-            : resultsCache.write;
+            : (
+                  rows: WarehouseResults['rows'],
+                  fields: WarehouseResults['fields'],
+              ) => {
+                  // Capture columns from the first batch if available
+                  if (!Object.keys(columns).length && fields) {
+                      columns = Object.entries(fields).reduce<ResultColumns>(
+                          (acc, [key, value]) => {
+                              acc[key] = {
+                                  reference: key,
+                                  type: value.type,
+                              };
+                              return acc;
+                          },
+                          {},
+                      );
+                  }
+                  resultsCache.write(rows);
+              };
 
         const warehouseResults = await warehouseClient.executeAsyncQuery(
             {
@@ -799,6 +818,7 @@ export class AsyncQueryService extends ProjectService {
 
         return {
             warehouseResults,
+            columns,
             pivotDetails: pivotConfiguration
                 ? {
                       valuesColumns: valuesColumnData,
@@ -849,6 +869,7 @@ export class AsyncQueryService extends ProjectService {
                     queryId,
                 },
                 pivotDetails,
+                columns,
             } = await AsyncQueryService.runQueryAndTransformRows({
                 warehouseClient,
                 query,
@@ -878,6 +899,7 @@ export class AsyncQueryService extends ProjectService {
             await this.updateCache(resultsCache.cacheKey, projectUuid, {
                 status: ResultsCacheStatus.READY,
                 total_row_count: pivotDetails?.totalRows ?? totalRows,
+                columns,
             });
 
             this.analytics.track({
@@ -1195,6 +1217,7 @@ export class AsyncQueryService extends ProjectService {
                                 error: null,
                                 total_row_count: resultsCache.totalRowCount,
                                 warehouse_execution_time_ms: 0, // When cache is hit, no query is executed
+                                // TODO: we need to update query history model here
                             },
                         );
 
